@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visualizing Residuals</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f6f8; display: flex; flex-direction: column; align-items: center; padding: 20px; color: #333; }
+        
+        h2 { margin-bottom: 5px; color: #2c3e50; }
+        p.subtitle { color: #666; margin-top: 0; font-size: 0.95em; }
+
+        .controls { 
+            background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); margin-bottom: 20px; 
+            display: flex; gap: 20px; align-items: center;
+        }
+        
+        .toggle-group { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 0.9em; cursor: pointer; }
+        input[type="checkbox"] { transform: scale(1.2); cursor: pointer; }
+
+        .container { display: flex; flex-direction: column; gap: 20px; }
+        
+        .chart-card {
+            background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            position: relative;
+        }
+        
+        .chart-title { position: absolute; top: 15px; left: 20px; font-weight: bold; color: #7f8c8d; font-size: 0.85em; text-transform: uppercase; }
+
+        /* SVG Elements */
+        .axis path, .axis line { stroke: #ddd; }
+        .axis text { fill: #999; font-size: 11px; }
+        
+        .point { fill: #3498db; stroke: white; stroke-width: 2px; cursor: move; transition: r 0.1s; }
+        .point:hover { fill: #2980b9; r: 7; }
+        .point.dragging { fill: #e74c3c; stroke: #c0392b; }
+
+        .reg-line { stroke: #2c3e50; stroke-width: 3px; pointer-events: none; }
+        
+        .resid-line { stroke: #e74c3c; stroke-width: 2px; stroke-dasharray: 4,2; opacity: 0.7; pointer-events: none; }
+        .resid-square { fill: #e74c3c; opacity: 0.15; stroke: none; pointer-events: none; }
+        
+        .zero-line { stroke: #2c3e50; stroke-width: 1.5px; stroke-dasharray: 4,4; opacity: 0.5; }
+
+        /* Stats Overlay */
+        .stats-overlay {
+            position: absolute; bottom: 20px; right: 20px; 
+            background: rgba(255,255,255,0.9); padding: 10px; border-radius: 4px; border: 1px solid #eee;
+            font-size: 0.85em; text-align: right; pointer-events: none;
+        }
+        .stat-val { font-weight: bold; color: #e74c3c; font-family: monospace; font-size: 1.1em; }
+
+    </style>
+</head>
+<body>
+
+    <h2>Visualizing Residuals & Least Squares</h2>
+    <p class="subtitle">Drag the blue points to see how the regression line minimizes the squares.</p>
+
+    <div class="controls">
+        <label class="toggle-group">
+            <input type="checkbox" id="checkLines" checked> Show Residual Lines (Errors)
+        </label>
+        <label class="toggle-group">
+            <input type="checkbox" id="checkSquares"> Show Squared Errors (Areas)
+        </label>
+        <button onclick="resetData()" style="padding: 6px 12px; cursor:pointer;">Reset Points</button>
+    </div>
+
+    <div class="container">
+        <div class="chart-card">
+            <div class="chart-title">Data & Regression Model</div>
+            <div id="scatter"></div>
+            <div class="stats-overlay">
+                Sum of Squared Errors (SSE): <div id="sse-val" class="stat-val">--</div>
+            </div>
+        </div>
+
+        <div class="chart-card">
+            <div class="chart-title">Residual Plot (Residuals vs. X)</div>
+            <div id="residplot"></div>
+        </div>
+    </div>
+
+<script>
+    // --- Config ---
+    const margin = {top: 30, right: 30, bottom: 30, left: 50};
+    const width = 600 - margin.left - margin.right;
+    const heightScatter = 350 - margin.top - margin.bottom;
+    const heightResid = 200 - margin.top - margin.bottom;
+
+    // --- State ---
+    let points = [];
+    
+    // --- Setup SVG ---
+    // 1. Scatterplot
+    const svgScatter = d3.select("#scatter").append("svg")
+        .attr("width", width + margin.left + margin.right)
+        .attr("height", heightScatter + margin.top + margin.bottom)
+        .append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+    // 2. Residual Plot
+    const svgResid = d3.select("#residplot").append("svg")
+        .attr("width", width + margin.left + margin.right)
+        .attr("height", heightResid + margin.top + margin.bottom)
+        .append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+    // --- Scales ---
+    const xSc = d3.scaleLinear().domain([0, 100]).range([0, width]);
+    const ySc = d3.scaleLinear().domain([0, 100]).range([heightScatter, 0]);
+    const yResidSc = d3.scaleLinear().domain([-30, 30]).range([heightResid, 0]); // Init range, will update
+
+    // --- Axes ---
+    svgScatter.append("g").attr("transform", `translate(0,${heightScatter})`).call(d3.axisBottom(xSc));
+    svgScatter.append("g").call(d3.axisLeft(ySc));
+
+    const xAxisResid = svgResid.append("g").attr("transform", `translate(0,${heightResid/2})`); // Will move
+    const yAxisResid = svgResid.append("g");
+
+    // --- Static Elements ---
+    const gSquares = svgScatter.append("g");
+    const gLines = svgScatter.append("g");
+    const regLine = svgScatter.append("line").attr("class", "reg-line");
+    const gPoints = svgScatter.append("g");
+    
+    // Residual Plot Elements
+    const zeroLine = svgResid.append("line").attr("class", "zero-line");
+    const gResidPoints = svgResid.append("g");
+    const gResidConnectors = svgResid.append("g"); // Vertical lines to 0
+
+    // --- Logic ---
+
+    function generateData() {
+        points = [];
+        for(let i=0; i<15; i++) {
+            let x = 10 + Math.random() * 80;
+            // Correlated y = 0.5x + 20 + noise
+            let y = 20 + 0.5 * x + (Math.random() - 0.5) * 30;
+            points.push({ id: i, x: x, y: y });
+        }
+        update();
+    }
+
+    function calculateRegression() {
+        const n = points.length;
+        const xMean = d3.mean(points, d => d.x);
+        const yMean = d3.mean(points, d => d.y);
+        
+        let num = 0, den = 0;
+        points.forEach(d => {
+            num += (d.x - xMean) * (d.y - yMean);
+            den += (d.x - xMean) ** 2;
+        });
+        
+        const slope = den === 0 ? 0 : num / den;
+        const intercept = yMean - slope * xMean;
+        
+        // Calculate Residuals & SSE
+        let sse = 0;
+        points.forEach(d => {
+            d.yPred = slope * d.x + intercept;
+            d.resid = d.y - d.yPred;
+            sse += d.resid ** 2;
+        });
+
+        return { slope, intercept, sse };
+    }
+
+    function update() {
+        const model = calculateRegression();
+        const showLines = document.getElementById('checkLines').checked;
+        const showSquares = document.getElementById('checkSquares').checked;
+
+        // 1. Update Stats
+        document.getElementById('sse-val').innerText = Math.round(model.sse).toLocaleString();
+
+        // 2. Draw Regression Line
+        // Extend slightly beyond domain for visual
+        const x1 = 0, x2 = 100;
+        const y1 = model.intercept;
+        const y2 = model.slope * 100 + model.intercept;
+
+        regLine.attr("x1", xSc(x1)).attr("y1", ySc(y1))
+               .attr("x2", xSc(x2)).attr("y2", ySc(y2));
+
+        // 3. Draw Residual Lines (Scatterplot)
+        const lines = gLines.selectAll("line").data(points, d => d.id);
+        lines.enter().append("line").attr("class", "resid-line")
+            .merge(lines)
+            .attr("x1", d => xSc(d.x)).attr("x2", d => xSc(d.x))
+            .attr("y1", d => ySc(d.y)).attr("y2", d => ySc(d.yPred))
+            .style("opacity", showLines ? 1 : 0);
+        lines.exit().remove();
+
+        // 4. Draw Residual Squares
+        const squares = gSquares.selectAll("rect").data(points, d => d.id);
+        squares.enter().append("rect").attr("class", "resid-square")
+            .merge(squares)
+            .attr("x", d => {
+                // Square always starts at top-left visually, but math varies
+                const size = Math.abs(ySc(d.y) - ySc(d.yPred));
+                // Draw square to the right of the line usually, or centered?
+                // Standard convention: corner touches point
+                return xSc(d.x); 
+            })
+            .attr("y", d => Math.min(ySc(d.y), ySc(d.yPred)))
+            .attr("width", d => Math.abs(ySc(d.y) - ySc(d.yPred))) // Width = Height in pixels
+            .attr("height", d => Math.abs(ySc(d.y) - ySc(d.yPred)))
+            .style("opacity", showSquares ? 0.2 : 0);
+        squares.exit().remove();
+
+        // 5. Draw Scatter Points
+        const pts = gPoints.selectAll("circle").data(points, d => d.id);
+        pts.enter().append("circle").attr("class", "point").attr("r", 6)
+            .call(d3.drag()
+                .on("start", function() { d3.select(this).classed("dragging", true); })
+                .on("drag", function(event, d) {
+                    // Update data
+                    d.x = Math.max(0, Math.min(100, xSc.invert(event.x)));
+                    d.y = Math.max(0, Math.min(100, ySc.invert(event.y)));
+                    update(); // Re-render loop
+                })
+                .on("end", function() { d3.select(this).classed("dragging", false); })
+            )
+            .merge(pts)
+            .attr("cx", d => xSc(d.x))
+            .attr("cy", d => ySc(d.y));
+        pts.exit().remove();
+
+        // --- RESIDUAL PLOT UPDATES ---
+        
+        // Dynamic Y-axis for residuals
+        const maxResid = d3.max(points, d => Math.abs(d.resid)) || 10;
+        yResidSc.domain([-maxResid * 1.2, maxResid * 1.2]);
+        
+        yAxisResid.transition().duration(50).call(d3.axisLeft(yResidSc).ticks(5));
+        
+        // Zero Line
+        const zeroY = yResidSc(0);
+        xAxisResid.attr("transform", `translate(0,${zeroY})`).call(d3.axisBottom(xSc).ticks(0).tickSize(0)); // Just the line
+        zeroLine.attr("x1", 0).attr("x2", width).attr("y1", zeroY).attr("y2", zeroY);
+
+        // Residual Points
+        const rPts = gResidPoints.selectAll("circle").data(points, d => d.id);
+        rPts.enter().append("circle").attr("class", "point").attr("r", 4)
+            .merge(rPts)
+            .attr("cx", d => xSc(d.x))
+            .attr("cy", d => yResidSc(d.resid))
+            .attr("fill", "#e74c3c"); // Different color for distinction
+        rPts.exit().remove();
+
+        // Residual Connectors (Vertical lines to 0 in residual plot)
+        const rLines = gResidConnectors.selectAll("line").data(points, d => d.id);
+        rLines.enter().append("line").attr("stroke", "#ccc")
+            .merge(rLines)
+            .attr("x1", d => xSc(d.x)).attr("x2", d => xSc(d.x))
+            .attr("y1", zeroY).attr("y2", d => yResidSc(d.resid));
+        rLines.exit().remove();
+    }
+
+    function resetData() {
+        generateData();
+    }
+
+    // Listeners
+    document.getElementById('checkLines').addEventListener('change', update);
+    document.getElementById('checkSquares').addEventListener('change', update);
+
+    // Init
+    generateData();
+
+</script>
+
+</body>
+</html>
